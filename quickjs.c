@@ -7167,7 +7167,9 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
         }
         break;
     case JS_TAG_MODULE:
-        abort(); /* never freed here */
+        /* Only reached after js_free_module_def() released the module
+           list reference while other module values were still alive. */
+        js_free_rt(rt, JS_VALUE_GET_PTR(v));
         break;
     case JS_TAG_BIG_INT:
         {
@@ -30364,6 +30366,11 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, m->private_value);
     JS_FreeValue(ctx, m->attributes);
     list_del(&m->link);
+    /* Module values (e.g. held by pending async evaluation callbacks)
+       can outlive the module list during context teardown. The last
+       JS_FreeValueRT() of such a value frees the remaining record. */
+    if (--JS_REF_COUNT(m) > 0)
+        return;
     js_free(ctx, m);
 }
 
