@@ -438,6 +438,37 @@ static void rejection_counter(JSContext *ctx, JSValueConst promise,
         c->reject_count++;
 }
 
+static JSModuleDef *pending_tla_loader(JSContext *ctx, const char *name,
+                                       void *opaque)
+{
+    assert(!strcmp(name, "pending"));
+    static const char code[] = "await new Promise(() => {});";
+    JSValue ret = JS_Eval(ctx, code, strlen(code), name,
+                          JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(ret));
+    JSModuleDef *m = JS_VALUE_GET_PTR(ret);
+    JS_FreeValue(ctx, ret);
+    return m;
+}
+
+// import() of a module whose top-level await never settles leaves reactions
+// holding the module record; freeing the runtime must not free it twice.
+static void module_pending_tla_import(void)
+{
+    JSRuntime *rt = new_runtime();
+    JS_SetModuleLoaderFunc(rt, NULL, pending_tla_loader, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret = eval(ctx, "import('pending')");
+    assert(!JS_IsException(ret));
+    assert(JS_IsPromise(ret));
+    JS_FreeValue(ctx, ret);
+    JSContext *c1;
+    while (JS_ExecutePendingJob(rt, &c1) > 0)
+        ;
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 // A synchronous module that throws at top level must surface exactly one unhandled rejection
 static void module_unhandled_rejection(void)
 {
@@ -2168,6 +2199,7 @@ int main(void)
     raw_context_global_var();
     is_array();
     module_serde();
+    module_pending_tla_import();
     module_unhandled_rejection();
     promise_mark_as_handled();
     promise_then();
