@@ -39927,7 +39927,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
-    JSValue obj;
+    JSValue obj = JS_UNDEFINED;
     JSModuleDef *m = NULL;
     JSAtom module_name;
     int i;
@@ -39945,10 +39945,9 @@ static JSValue JS_ReadModule(BCReaderState *s)
     m = js_new_module_def(ctx, module_name);
     if (!m)
         goto fail;
-    obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
+    obj = JS_NewModuleValue(ctx, m);
     if (bc_get_leb128_int(s, &m->req_module_entries_count))
         goto fail;
-    obj = JS_NewModuleValue(ctx, m);
     if (m->req_module_entries_count != 0) {
         m->req_module_entries_size = m->req_module_entries_count;
         m->req_module_entries = js_mallocz(ctx, sizeof(m->req_module_entries[0]) * m->req_module_entries_size);
@@ -40045,6 +40044,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
  fail:
     if (m) {
         js_free_module_def(ctx, m);
+        JS_FreeValue(ctx, obj);
     }
     return JS_EXCEPTION;
 }
