@@ -4928,11 +4928,11 @@ JSValue js_std_await(JSContext *ctx, JSValue obj)
             JS_FreeValue(ctx, obj);
             break;
         } else if (state == JS_PROMISE_PENDING) {
-            JSContext *ctx1;
             int err;
-            err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
+            /* the job's realm may be freed when the job returns */
+            err = JS_ExecutePendingJob(JS_GetRuntime(ctx), NULL);
             if (err < 0) {
-                js_std_dump_error(ctx1);
+                js_std_dump_error(ctx);
             }
             if (err == 0)
                 js_std_promise_rejection_check(ctx);

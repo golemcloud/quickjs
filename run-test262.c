@@ -2049,10 +2049,10 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
             JS_FreeValue(ctx, res_val);
         }
         for(;;) {
-            JSContext *ctx1;
-            ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
+            /* the job's realm may be freed when the job returns */
+            ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), NULL);
             if (ret < 0) {
-                js_std_dump_error(ctx1);
+                js_std_dump_error(ctx);
                 ret_code = 1;
             } else if (ret == 0) {
                 break;
