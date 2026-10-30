@@ -418,7 +418,6 @@ static void module_serde(void)
     assert(JS_IsUndefined(result));
     JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, mod);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
