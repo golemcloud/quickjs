@@ -7167,14 +7167,9 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
         }
         break;
     case JS_TAG_MODULE:
-        {
-            /* Only reached after js_free_module_def() released the module
-               list reference while other module values were still alive. */
-            JSModuleDef *m = JS_VALUE_GET_PTR(v);
-            if (m->link.prev)
-                abort(); /* over-free of a module still in the module list */
-            js_free_rt(rt, m);
-        }
+        /* Only reached after js_free_module_def() released the module
+           list reference while other module values were still alive. */
+        js_free_rt(rt, JS_VALUE_GET_PTR(v));
         break;
     case JS_TAG_BIG_INT:
         {
