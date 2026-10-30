@@ -63181,6 +63181,7 @@ static void js_finrec_finalizer(JSRuntime *rt, JSValueConst val)
             js_finrec_free(rt, fre);
         }
         JS_FreeValueRT(rt, frd->cb);
+        JS_FreeContext(frd->ctx);
         js_free_rt(rt, frd);
     }
 }
@@ -63199,6 +63200,7 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, fre->cb, mark_func);
             mark_func(rt, &fre->ctx->header);
         }
+        mark_func(rt, &frd->ctx->header);
     }
 }
 
@@ -63219,7 +63221,7 @@ static JSValue js_finrec_constructor(JSContext *ctx, JSValueConst new_target,
         return JS_EXCEPTION;
     }
     init_list_head(&frd->entries);
-    frd->ctx = ctx;
+    frd->ctx = JS_DupContext(ctx);
     frd->cb = js_dup(cb);
     JS_SetOpaqueInternal(obj, frd);
     return obj;

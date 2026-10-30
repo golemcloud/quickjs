@@ -494,6 +494,33 @@ static void pending_module_lifetime(void)
     JS_FreeRuntime(rt);
 }
 
+// A FinalizationRegistry can outlive every other reference to the realm
+// that constructed it; registering must not use a freed context.
+static void finalization_registry_realm_lifetime(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *a = JS_NewContext(rt);
+    JSContext *b = JS_NewContext(rt);
+    JSValue global = JS_GetGlobalObject(a);
+    JSValue ctor = JS_GetPropertyStr(a, global, "FinalizationRegistry");
+    JS_FreeValue(a, global);
+    global = JS_GetGlobalObject(b);
+    JS_SetPropertyStr(b, global, "OtherRegistry", ctor);
+    JS_FreeValue(b, global);
+    JSValue ret = eval(b, "globalThis.registry = new OtherRegistry(() => {});"
+                          "Object.setPrototypeOf(registry, null);"
+                          "delete globalThis.OtherRegistry;");
+    assert(!JS_IsException(ret));
+    JS_FreeValue(b, ret);
+    JS_FreeContext(a);
+    JS_RunGC(rt);
+    ret = eval(b, "FinalizationRegistry.prototype.register.call(registry, {}, 1)");
+    assert(!JS_IsException(ret));
+    JS_FreeValue(b, ret);
+    JS_FreeContext(b);
+    JS_FreeRuntime(rt);
+}
+
 struct rejection_counts {
     int reject_count;
     int handle_count;
@@ -2273,6 +2300,7 @@ int main(void)
     module_pending_tla_import();
     pending_job_lifetime();
     pending_module_lifetime();
+    finalization_registry_realm_lifetime();
     module_unhandled_rejection();
     promise_mark_as_handled();
     promise_then();
