@@ -967,6 +967,23 @@ static JSValue promise_reaction_hook_check(JSContext *ctx, JSValueConst this_val
     return JS_UNDEFINED;
 }
 
+static JSValue promise_reaction_hook_check_parent(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc, JSValueConst *argv)
+{
+    PromiseReactionHookState *s = JS_GetContextOpaque(ctx);
+    int i;
+
+    assert(argc == 1);
+    for (i = 0; i < s->parent_count; i++) {
+        if (JS_IsSameValue(ctx, s->parents[i], argv[0]))
+            break;
+    }
+    assert(i < s->parent_count);
+    s->checks++;
+    return JS_UNDEFINED;
+}
+
 static int promise_reaction_hook_interrupt(JSContext *ctx, void *opaque)
 {
     PromiseReactionHookState *s = opaque;
@@ -1046,6 +1063,24 @@ static void promise_reaction_hooks(void)
         {"const source = Promise.resolve();"
          "globalThis.task = (async () => { await source; checkHook(source, true);"
          "await source; checkHook(source, true) })()", 2},
+        {"const source = Promise.resolve();"
+         "async function* g() { await source; checkHook(source, true); yield 1 }"
+         "globalThis.it = g(); it.next()", 1},
+        {"let resolve; const source = new Promise(r => resolve = r);"
+         "async function* g() { await source; checkHook(source, true) }"
+         "globalThis.it = g(); it.next(); resolve()", 1},
+        {"const source = Promise.reject();"
+         "async function* g() { try { await source }"
+         "catch (_) { checkHook(source, true) } }"
+         "globalThis.it = g(); it.next()", 1},
+        {"const source = Promise.resolve();"
+         "async function* g() { await source; checkHook(source, true) }"
+         "globalThis.first = g(); globalThis.second = g();"
+         "first.next(); second.next()", 2},
+        {"const source = Promise.resolve();"
+         "async function* g() { yield 1 }"
+         "globalThis.it = g(); it.next(); it.next()"
+         ".then(() => { it.return(source); checkParent(source) })", 1},
         {"globalThis.child = Promise.resolve().then(() => {"
          "checkHook(child); for (;;) {} })", 1, true},
         {"const source = Promise.resolve();"
@@ -1069,6 +1104,9 @@ static void promise_reaction_hooks(void)
         JS_SetPropertyStr(ctx, global, "drainJobs",
                           JS_NewCFunction(ctx, promise_reaction_hook_drain,
                                           "drainJobs", 0));
+        JS_SetPropertyStr(ctx, global, "checkParent",
+                          JS_NewCFunction(ctx, promise_reaction_hook_check_parent,
+                                          "checkParent", 1));
         JS_SetPropertyStr(ctx, global, "nativeThen",
                           JS_NewCFunction(ctx, promise_reaction_hook_native_then,
                                           "nativeThen", 1));
