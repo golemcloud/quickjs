@@ -21499,6 +21499,34 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
+/* An await reaction normally has no result capability: the spec's
+   thrownawayCapability is not observable. With a promise hook installed,
+   create it so each await has its own continuation promise, whose parent is
+   the awaited promise, instead of inheriting the identity of a shared
+   awaited promise. 'continuation_funcs' receives the capability's resolving
+   functions, or undefined values when no hook is installed. */
+static int js_await_continuation_capability(JSContext *ctx,
+                                            JSValueConst promise,
+                                            JSValue *continuation_funcs)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValueLink link;
+    JSValue continuation;
+
+    continuation_funcs[0] = JS_UNDEFINED;
+    continuation_funcs[1] = JS_UNDEFINED;
+    if (!rt->promise_hook)
+        return 0;
+    link = (JSValueLink){rt->parent_promise, promise};
+    rt->parent_promise = &link;
+    continuation = JS_NewPromiseCapability(ctx, continuation_funcs);
+    rt->parent_promise = link.next;
+    if (JS_IsException(continuation))
+        return -1;
+    JS_FreeValue(ctx, continuation);
+    return 0;
+}
+
 static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
 {
     bool is_success = true;
@@ -21551,26 +21579,12 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
                 goto fail;
             }
 
-            /* Keep the thrown-away capability optimization when there is no
-               hook. With a hook, each await needs its own continuation promise
-               rather than inheriting the identity of a shared awaited promise. */
-            for(i = 0; i < 2; i++)
-                resolving_funcs1[i] = JS_UNDEFINED;
-            if (ctx->rt->promise_hook) {
-                JSRuntime *rt = ctx->rt;
-                JSValueLink link = {rt->parent_promise, promise};
-                JSValue continuation;
-
-                rt->parent_promise = &link;
-                continuation = JS_NewPromiseCapability(ctx, resolving_funcs1);
-                rt->parent_promise = link.next;
-                if (JS_IsException(continuation)) {
-                    JS_FreeValue(ctx, promise);
-                    for(i = 0; i < 2; i++)
-                        JS_FreeValue(ctx, resolving_funcs[i]);
-                    goto fail;
-                }
-                JS_FreeValue(ctx, continuation);
+            if (js_await_continuation_capability(ctx, promise,
+                                                 resolving_funcs1)) {
+                JS_FreeValue(ctx, promise);
+                for(i = 0; i < 2; i++)
+                    JS_FreeValue(ctx, resolving_funcs[i]);
+                goto fail;
             }
             res = perform_promise_then(ctx, promise,
                                        vc(resolving_funcs),
@@ -21778,16 +21792,20 @@ static int js_async_generator_await(JSContext *ctx,
         goto fail;
     }
 
-    /* Note: no need to create 'thrownawayCapability' as in
-       the spec */
-    for(i = 0; i < 2; i++)
-        resolving_funcs1[i] = JS_UNDEFINED;
+    if (js_await_continuation_capability(ctx, promise, resolving_funcs1)) {
+        JS_FreeValue(ctx, promise);
+        for(i = 0; i < 2; i++)
+            JS_FreeValue(ctx, resolving_funcs[i]);
+        goto fail;
+    }
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs),
                                vc(resolving_funcs1));
     JS_FreeValue(ctx, promise);
-    for(i = 0; i < 2; i++)
+    for(i = 0; i < 2; i++) {
         JS_FreeValue(ctx, resolving_funcs[i]);
+        JS_FreeValue(ctx, resolving_funcs1[i]);
+    }
     if (res)
         goto fail;
     return 0;
@@ -21870,13 +21888,19 @@ static int js_async_generator_completed_return(JSContext *ctx,
         JS_FreeValue(ctx, promise);
         return -1;
     }
-    resolving_funcs[0] = JS_UNDEFINED;
-    resolving_funcs[1] = JS_UNDEFINED;
+    if (js_await_continuation_capability(ctx, promise, resolving_funcs)) {
+        JS_FreeValue(ctx, resolving_funcs1[0]);
+        JS_FreeValue(ctx, resolving_funcs1[1]);
+        JS_FreeValue(ctx, promise);
+        return -1;
+    }
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs1),
                                vc(resolving_funcs));
     JS_FreeValue(ctx, resolving_funcs1[0]);
     JS_FreeValue(ctx, resolving_funcs1[1]);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
     JS_FreeValue(ctx, promise);
     return res;
 }
