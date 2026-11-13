@@ -21499,6 +21499,34 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
+/* An await reaction normally has no result capability: the spec's
+   thrownawayCapability is not observable. With a promise hook installed,
+   create it so each await has its own continuation promise, whose parent is
+   the awaited promise, instead of inheriting the identity of a shared
+   awaited promise. 'continuation_funcs' receives the capability's resolving
+   functions, or undefined values when no hook is installed. */
+static int js_await_continuation_capability(JSContext *ctx,
+                                            JSValueConst promise,
+                                            JSValue *continuation_funcs)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValueLink link;
+    JSValue continuation;
+
+    continuation_funcs[0] = JS_UNDEFINED;
+    continuation_funcs[1] = JS_UNDEFINED;
+    if (!rt->promise_hook)
+        return 0;
+    link = (JSValueLink){rt->parent_promise, promise};
+    rt->parent_promise = &link;
+    continuation = JS_NewPromiseCapability(ctx, continuation_funcs);
+    rt->parent_promise = link.next;
+    if (JS_IsException(continuation))
+        return -1;
+    JS_FreeValue(ctx, continuation);
+    return 0;
+}
+
 static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
 {
     bool is_success = true;
@@ -21551,16 +21579,21 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
                 goto fail;
             }
 
-            /* Note: no need to create 'thrownawayCapability' as in
-               the spec */
-            for(i = 0; i < 2; i++)
-                resolving_funcs1[i] = JS_UNDEFINED;
+            if (js_await_continuation_capability(ctx, promise,
+                                                 resolving_funcs1)) {
+                JS_FreeValue(ctx, promise);
+                for(i = 0; i < 2; i++)
+                    JS_FreeValue(ctx, resolving_funcs[i]);
+                goto fail;
+            }
             res = perform_promise_then(ctx, promise,
                                        vc(resolving_funcs),
                                        vc(resolving_funcs1));
             JS_FreeValue(ctx, promise);
-            for(i = 0; i < 2; i++)
+            for(i = 0; i < 2; i++) {
                 JS_FreeValue(ctx, resolving_funcs[i]);
+                JS_FreeValue(ctx, resolving_funcs1[i]);
+            }
             if (res)
                 goto fail;
         }
@@ -21759,16 +21792,20 @@ static int js_async_generator_await(JSContext *ctx,
         goto fail;
     }
 
-    /* Note: no need to create 'thrownawayCapability' as in
-       the spec */
-    for(i = 0; i < 2; i++)
-        resolving_funcs1[i] = JS_UNDEFINED;
+    if (js_await_continuation_capability(ctx, promise, resolving_funcs1)) {
+        JS_FreeValue(ctx, promise);
+        for(i = 0; i < 2; i++)
+            JS_FreeValue(ctx, resolving_funcs[i]);
+        goto fail;
+    }
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs),
                                vc(resolving_funcs1));
     JS_FreeValue(ctx, promise);
-    for(i = 0; i < 2; i++)
+    for(i = 0; i < 2; i++) {
         JS_FreeValue(ctx, resolving_funcs[i]);
+        JS_FreeValue(ctx, resolving_funcs1[i]);
+    }
     if (res)
         goto fail;
     return 0;
@@ -21851,13 +21888,19 @@ static int js_async_generator_completed_return(JSContext *ctx,
         JS_FreeValue(ctx, promise);
         return -1;
     }
-    resolving_funcs[0] = JS_UNDEFINED;
-    resolving_funcs[1] = JS_UNDEFINED;
+    if (js_await_continuation_capability(ctx, promise, resolving_funcs)) {
+        JS_FreeValue(ctx, resolving_funcs1[0]);
+        JS_FreeValue(ctx, resolving_funcs1[1]);
+        JS_FreeValue(ctx, promise);
+        return -1;
+    }
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs1),
                                vc(resolving_funcs));
     JS_FreeValue(ctx, resolving_funcs1[0]);
     JS_FreeValue(ctx, resolving_funcs1[1]);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
     JS_FreeValue(ctx, promise);
     return res;
 }
@@ -55595,10 +55638,15 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
 {
     JSValueConst handler, func;
     JSValue res, res2;
-    JSValueConst arg;
+    JSValueConst arg, hook_promise;
+    JSRuntime *rt = ctx->rt;
     bool is_reject;
 
-    assert(argc == 5);
+    assert(argc == 6);
+    hook_promise = argv[5];
+    if (rt->promise_hook)
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, hook_promise,
+                         JS_UNDEFINED, rt->promise_hook_opaque);
     handler = argv[2];
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
@@ -55616,8 +55664,10 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
-            return JS_EXCEPTION;
+        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+            res2 = JS_EXCEPTION;
+            goto done;
+        }
         res = JS_GetException(ctx);
     }
     func = argv[is_reject];
@@ -55631,6 +55681,10 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     JS_FreeValue(ctx, res);
 
+ done:
+    if (rt->promise_hook)
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, hook_promise,
+                         JS_UNDEFINED, rt->promise_hook_opaque);
     return res2;
 }
 
@@ -55654,7 +55708,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
-    JSValueConst args[5];
+    JSPromiseFunctionData *hook_data;
+    JSValueConst args[6];
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -55680,7 +55735,10 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        hook_data = JS_GetOpaque(rd->resolving_funcs[0],
+                                 JS_CLASS_PROMISE_RESOLVE_FUNCTION);
+        args[5] = hook_data ? hook_data->promise : promise;
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -56493,7 +56551,9 @@ static __exception int perform_promise_then(JSContext *ctx,
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
-        JSValueConst args[5];
+        JSValueConst args[6];
+        JSPromiseFunctionData *hook_data;
+
         call_promise_rejection_tracker(ctx, promise, true);
         i = s->promise_state - JS_PROMISE_FULFILLED;
         rd = rd_array[i];
@@ -56502,7 +56562,10 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        hook_data = JS_GetOpaque(rd->resolving_funcs[0],
+                                 JS_CLASS_PROMISE_RESOLVE_FUNCTION);
+        args[5] = hook_data ? hook_data->promise : promise;
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
