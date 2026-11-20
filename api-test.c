@@ -465,6 +465,73 @@ static void pending_job_lifetime(void)
     JS_FreeRuntime(rt);
 }
 
+typedef struct {
+    uint64_t current_tag;
+    int count;
+    JSJob *jobs[4];
+    uint64_t tags[4];
+} JobHookState;
+
+static uint64_t job_hook_tag(JSRuntime *rt, void *opaque)
+{
+    return ((JobHookState *)opaque)->current_tag;
+}
+
+static void job_hook_enqueue(JSRuntime *rt, JSJob *job, uint64_t tag,
+                             void *opaque)
+{
+    JobHookState *s = opaque;
+    assert(s->count < countof(s->jobs));
+    s->jobs[s->count] = job;
+    s->tags[s->count] = tag;
+    s->count++;
+}
+
+// A promise reaction job carries the tag current when the reaction was
+// registered; the embedder executes or frees every job it receives.
+static void job_hooks(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *job_ctx;
+    JobHookState s = { 0 };
+    JSValue ret;
+    const char *order;
+
+    JS_SetJobHooks(rt, job_hook_tag, job_hook_enqueue, &s);
+    ret = eval(ctx, "globalThis.order = '';"
+                    "globalThis.p = new Promise(r => globalThis.resolve = r);");
+    JS_FreeValue(ctx, ret);
+    s.current_tag = 1;
+    ret = eval(ctx, "p.then(() => order += 'registered by 1')");
+    JS_FreeValue(ctx, ret);
+    s.current_tag = 2;
+    ret = eval(ctx, "Promise.resolve().then(() => order += ', 2'); resolve()");
+    JS_FreeValue(ctx, ret);
+    assert(s.count == 2);
+    assert(s.tags[0] == 2);
+    assert(s.tags[1] == 1);
+    assert(!JS_IsJobPending(rt));
+    assert(JS_ExecutePendingJob(rt, &job_ctx) == 0);
+
+    assert(JS_ExecuteJob(rt, s.jobs[1], &job_ctx) == 1);
+    assert(JS_ExecuteJob(rt, s.jobs[0], &job_ctx) == 1);
+    ret = eval(ctx, "order");
+    order = JS_ToCString(ctx, ret);
+    assert(order && !strcmp(order, "registered by 1, 2"));
+    JS_FreeCString(ctx, order);
+    JS_FreeValue(ctx, ret);
+
+    s.current_tag = 3;
+    ret = eval(ctx, "Promise.resolve({ held: [1, 2, 3] }).then(v => v)");
+    JS_FreeValue(ctx, ret);
+    assert(s.count == 3);
+    assert(s.tags[2] == 3);
+    JS_FreeJob(rt, s.jobs[2]);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void pending_module_lifetime(void)
 {
     static const char module_source[] =
@@ -2540,6 +2607,7 @@ int main(void)
     module_serde();
     module_pending_tla_import();
     pending_job_lifetime();
+    job_hooks();
     pending_module_lifetime();
     finalization_registry_realm_lifetime();
     module_unhandled_rejection();

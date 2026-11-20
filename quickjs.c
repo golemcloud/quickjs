@@ -392,6 +392,9 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    JSJobTagFunc *job_tag_func;
+    JSEnqueueJobHook *enqueue_job_hook;
+    void *job_hooks_opaque;
 
     bool module_normalize_has_attr;
     union {
@@ -2492,9 +2495,23 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
     rt->sab_funcs = *sf;
 }
 
+void JS_SetJobHooks(JSRuntime *rt, JSJobTagFunc *tag_func,
+                    JSEnqueueJobHook *enqueue_hook, void *opaque)
+{
+    rt->job_tag_func = tag_func;
+    rt->enqueue_job_hook = enqueue_hook;
+    rt->job_hooks_opaque = opaque;
+}
+
+static uint64_t js_job_tag(JSRuntime *rt)
+{
+    return rt->job_tag_func ? rt->job_tag_func(rt, rt->job_hooks_opaque) : 0;
+}
+
 /* return 0 if OK, < 0 if exception */
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+static int js_enqueue_job_with_tag(JSContext *ctx, uint64_t tag,
+                                   JSJobFunc *job_func,
+                                   int argc, JSValueConst *argv)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2511,8 +2528,19 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    if (rt->enqueue_job_hook)
+        rt->enqueue_job_hook(rt, e, tag, rt->job_hooks_opaque);
+    else
+        list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+/* return 0 if OK, < 0 if exception */
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    return js_enqueue_job_with_tag(ctx, js_job_tag(ctx->rt), job_func,
+                                   argc, argv);
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
@@ -2534,10 +2562,7 @@ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
    destroyed or if no job was pending. */
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
-    JSContext *ctx;
     JSJobEntry *e;
-    JSValue res;
-    int i, ret;
 
     if (list_empty(&rt->job_list)) {
         if (pctx)
@@ -2548,6 +2573,25 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     /* get the first pending job and execute it */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
+    return JS_ExecuteJob(rt, e, pctx);
+}
+
+void JS_FreeJob(JSRuntime *rt, JSJob *e)
+{
+    int i;
+
+    for(i = 0; i < e->argc; i++)
+        JS_FreeValueRT(rt, e->argv[i]);
+    JS_FreeContext(e->realm);
+    js_free_rt(rt, e);
+}
+
+int JS_ExecuteJob(JSRuntime *rt, JSJob *e, JSContext **pctx)
+{
+    JSContext *ctx;
+    JSValue res;
+    int i, ret;
+
     ctx = e->realm;
     res = e->job_func(ctx, e->argc, vc(e->argv));
     for(i = 0; i < e->argc; i++)
@@ -2662,11 +2706,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
-        JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        JS_FreeContext(e->realm);
-        js_free_rt(rt, e);
+        JS_FreeJob(rt, list_entry(el, JSJobEntry, link));
     }
     init_list_head(&rt->job_list);
 
@@ -55553,6 +55593,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    uint64_t tag; /* job tag when the reaction was registered */
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
@@ -55738,7 +55779,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         hook_data = JS_GetOpaque(rd->resolving_funcs[0],
                                  JS_CLASS_PROMISE_RESOLVE_FUNCTION);
         args[5] = hook_data ? hook_data->promise : promise;
-        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
+        js_enqueue_job_with_tag(ctx, rd->tag, promise_reaction_job, 6, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -56544,6 +56585,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
+        rd->tag = js_job_tag(ctx->rt);
         rd_array[i] = rd;
     }
 
