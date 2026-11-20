@@ -1246,6 +1246,31 @@ JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
+/* Job hooks let the embedder keep the jobs, for example to run the jobs of
+   different callers separately.
+
+   Every job has a tag: the value the tag function returned when a promise
+   reaction was registered (then, await) for a promise reaction job, and the
+   value it returned when the job was enqueued for any other job. Without a
+   tag function, every tag is 0.
+
+   With an enqueue hook, QuickJS passes every new job and its tag to the hook
+   instead of queuing it, and JS_IsJobPending and JS_ExecutePendingJob see no
+   jobs. The embedder then owns the job: it must pass it exactly once to
+   JS_ExecuteJob or JS_FreeJob, before JS_FreeRuntime. The hooks may be called
+   during garbage collection and while QuickJS settles a promise, so they must
+   not call into QuickJS. */
+typedef struct JSJobEntry JSJob;
+typedef uint64_t JSJobTagFunc(JSRuntime *rt, void *opaque);
+typedef void JSEnqueueJobHook(JSRuntime *rt, JSJob *job, uint64_t tag,
+                              void *opaque);
+JS_EXTERN void JS_SetJobHooks(JSRuntime *rt, JSJobTagFunc *tag_func,
+                              JSEnqueueJobHook *enqueue_hook, void *opaque);
+/* Executes and frees the job. Returns and reports '*pctx' like
+   JS_ExecutePendingJob. */
+JS_EXTERN int JS_ExecuteJob(JSRuntime *rt, JSJob *job, JSContext **pctx);
+JS_EXTERN void JS_FreeJob(JSRuntime *rt, JSJob *job);
+
 /* Structure to retrieve (de)serialized SharedArrayBuffer objects. */
 typedef struct JSSABTab {
     uint8_t **tab;
